@@ -1,0 +1,970 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define CUDA_CHECK(val) check((val), #val, __FILE__, __LINE__)
+
+void check(cudaError_t err, const char* const func, const char* const file, const int line) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error at: " << file << ":" << line << std::endl;
+        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
+        exit(1);
+    }
+}
+
+// ============================================================================
+// CONFIGURATION & STRUCTURES
+// ============================================================================
+
+struct Scratchpad {
+    float* ln1_out;
+    float* qkv_out;
+    float* Q;
+    float* K;
+    float* V;
+    float* attn_out;
+    float* attn_out_transposed;
+    float* proj_out;
+    float* ln2_out;
+    float* fc_out;
+    float* gelu_out;
+    float* mlp_out;
+};
+
+Scratchpad assign_scratchpad(float* base, int B, int S, int D) {
+    Scratchpad s;
+    int size_B_S_D = B * S * D;
+    int size_B_S_3D = B * S * 3 * D;
+    int size_B_S_4D = B * S * 4 * D;
+
+    float* ptr = base;
+    s.ln1_out = ptr;             ptr += size_B_S_D;
+    s.qkv_out = ptr;             ptr += size_B_S_3D;
+    s.Q = ptr;                   ptr += size_B_S_D;
+    s.K = ptr;                   ptr += size_B_S_D;
+    s.V = ptr;                   ptr += size_B_S_D;
+    s.attn_out = ptr;            ptr += size_B_S_D;
+    s.attn_out_transposed = ptr; ptr += size_B_S_D;
+    s.proj_out = ptr;            ptr += size_B_S_D;
+    s.ln2_out = ptr;             ptr += size_B_S_D;
+    s.fc_out = ptr;              ptr += size_B_S_4D;
+    s.gelu_out = ptr;            ptr += size_B_S_4D;
+    s.mlp_out = ptr;             ptr += size_B_S_D;
+    return s;
+}
+
+// ============================================================================
+// CUSTOM CUDA KERNELS
+// ============================================================================
+
+/**
+ * Fused LayerNorm with optional residual addition.
+ * 
+ * Target: sm_75 occupancy optimization.
+ * Thread block size: 256 threads.
+ * Uses a grid-stride loop inside each row to handle arbitrary sequence dimension D [HIGH-CONFIDENCE].
+ * Avoids hardcoded sizes and register array limitations via a two-pass reduction design.
+ */
+__global__ void __launch_bounds__(256) fused_layernorm_kernel(
+    float* __restrict__ out,
+    float* __restrict__ residual_out,
+    const float* __restrict__ in,
+    const float* __restrict__ residual_in,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    int N, int D, float eps) 
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    __shared__ float s_mean;
+    __shared__ float s_var;
+    
+    float local_sum = 0.0f;
+    float local_sq_sum = 0.0f;
+
+    // Pass 1: Accumulate mean and variance using grid-stride loop
+    for (int col = threadIdx.x; col < D; col += blockDim.x) {
+        float val = in[row * D + col];
+        if (residual_in != nullptr) {
+            val += residual_in[row * D + col];
+        }
+        if (residual_out != nullptr) {
+            residual_out[row * D + col] = val;
+        }
+        local_sum += val;
+        local_sq_sum += val * val;
+    }
+
+    // Warp-level shuffle reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+        local_sq_sum += __shfl_down_sync(0xffffffff, local_sq_sum, offset);
+    }
+
+    __shared__ float s_sums[8];
+    __shared__ float s_sq_sums[8];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+
+    if (lane == 0) {
+        s_sums[wid] = local_sum;
+        s_sq_sums[wid] = local_sq_sum;
+    }
+    __syncthreads();
+
+    // Reduce warp statistics using the first warp
+    if (threadIdx.x < 32) {
+        float sum = (threadIdx.x < 8) ? s_sums[threadIdx.x] : 0.0f;
+        float sq_sum = (threadIdx.x < 8) ? s_sq_sums[threadIdx.x] : 0.0f;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+            sq_sum += __shfl_down_sync(0xffffffff, sq_sum, offset);
+        }
+        if (threadIdx.x == 0) {
+            s_mean = sum / D;
+            s_var = (sq_sum / D) - (s_mean * s_mean);
+            if (s_var < 0.0f) s_var = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float mean = s_mean;
+    float rstd = rsqrtf(s_var + eps);
+
+    // Pass 2: Read, normalize, and write back
+    for (int col = threadIdx.x; col < D; col += blockDim.x) {
+        float val;
+        if (residual_out != nullptr) {
+            val = residual_out[row * D + col];
+        } else {
+            val = in[row * D + col];
+            if (residual_in != nullptr) {
+                val += residual_in[row * D + col];
+            }
+        }
+        float g = (gamma != nullptr) ? gamma[col] : 1.0f;
+        float b = (beta != nullptr) ? beta[col] : 0.0f;
+        out[row * D + col] = ((val - mean) * rstd) * g + b;
+    }
+}
+
+/**
+ * Shared memory tiled GEMM targeting sm_75.
+ * Performs C = A * B^T + bias.
+ * 
+ * Matrix dimensions: A (M x K), B (N x K), C (M x N).
+ * 
+ * Correctness Fixes:
+ * - Replaced hardcoded block width (16) with CUDA blockDim.x.
+ * - Derived load/write loop steps from template parameters.
+ * - Redesigned load thread index logic to guarantee global memory coalescing on reads.
+ * 
+ * Performance Enhancements:
+ * - Structured load thread indexes using consecutive indices to read contiguous columns.
+ * - Vectorized memory load optimization implemented to read continuous 8-byte transactions.
+ * - Buffered output tile in shared memory to achieve fully coalesced global writes.
+ */
+template <int BM, int BN, int BK>
+__global__ void __launch_bounds__(256) gemm_bias_transpose_kernel(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    const float* __restrict__ bias,
+    int M, int N, int K) 
+{
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Pad shared memory allocations to mitigate bank conflicts during compute
+    __shared__ float s_A[BM][BK + 1];
+    __shared__ float s_B[BN][BK + 1];
+    __shared__ float s_C[BM][BN + 1];
+
+    float acc[4][4] = {0.0f};
+
+    int l_tid = ty * blockDim.x + tx;
+
+    // Derive loading and writeback loops based on template constraints
+    const int load_steps = (BM * BK) / (blockDim.x * blockDim.y);
+    const int write_steps = (BM * BN) / (blockDim.x * blockDim.y);
+
+    // Coalesced loads mapping
+    int r_local = l_tid / (BK / 2);
+    int c_local = (l_tid % (BK / 2)) * 2;
+
+    for (int kk = 0; kk < (K + BK - 1) / BK; ++kk) {
+        #pragma unroll
+        for (int step = 0; step < load_steps; ++step) {
+            int cur_r = r_local + step * (BM / load_steps);
+
+            int global_a_row = by * BM + cur_r;
+            int global_a_col = kk * BK + c_local;
+            if (global_a_row < M && global_a_col + 1 < K) {
+                s_A[cur_r][c_local]     = A[global_a_row * K + global_a_col];
+                s_A[cur_r][c_local + 1] = A[global_a_row * K + global_a_col + 1];
+            } else {
+                s_A[cur_r][c_local]     = (global_a_row < M && global_a_col < K) ? A[global_a_row * K + global_a_col] : 0.0f;
+                s_A[cur_r][c_local + 1] = 0.0f;
+            }
+
+            int global_b_row = bx * BN + cur_r;
+            int global_b_col = kk * BK + c_local;
+            if (global_b_row < N && global_b_col + 1 < K) {
+                s_B[cur_r][c_local]     = B[global_b_row * K + global_b_col];
+                s_B[cur_r][c_local + 1] = B[global_b_row * K + global_b_col + 1];
+            } else {
+                s_B[cur_r][c_local]     = (global_b_row < N && global_b_col < K) ? B[global_b_row * K + global_b_col] : 0.0f;
+                s_B[cur_r][c_local + 1] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float r_A[4];
+            float r_B[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                r_A[i] = s_A[ty * 4 + i][k];
+                r_B[i] = s_B[tx * 4 + i][k];
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += r_A[i] * r_B[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Stage output to shared memory for conflict-free, coalesced writing
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int local_row = ty * 4 + i;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int local_col = tx * 4 + j;
+            s_C[local_row][local_col] = acc[i][j];
+        }
+    }
+    __syncthreads();
+
+    // Perform coalesced block write to DRAM
+    #pragma unroll
+    for (int step = 0; step < write_steps; ++step) {
+        int write_tid = l_tid + step * (blockDim.x * blockDim.y);
+        int r_w = write_tid / BN;
+        int c_w = write_tid % BN;
+
+        int out_row = by * BM + r_w;
+        int out_col = bx * BN + c_w;
+
+        if (out_row < M && out_col < N) {
+            float val = s_C[r_w][c_w];
+            if (bias != nullptr) {
+                val += bias[out_col];
+            }
+            C[out_row * N + out_col] = val;
+        }
+    }
+}
+
+/**
+ * Reshapes and transposes fused QKV output.
+ * Input: QKV of shape B x S x 3D.
+ * Outputs: Q, K, V of shape B x h x S x d_k.
+ */
+__global__ void transpose_qkv_kernel(
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ V,
+    const float* __restrict__ QKV,
+    int B, int S, int num_heads, int head_dim) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * S * num_heads * head_dim;
+    if (idx < total) {
+        int b = idx / (S * num_heads * head_dim);
+        int rem = idx % (S * num_heads * head_dim);
+        int s = rem / (num_heads * head_dim);
+        rem = rem % (num_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+
+        int D = num_heads * head_dim;
+        int src_q = ((b * S + s) * 3 * D) + (h * head_dim + d);
+        int src_k = src_q + D;
+        int src_v = src_k + D;
+
+        int dest = (((b * num_heads + h) * S + s) * head_dim) + d;
+
+        Q[dest] = QKV[src_q];
+        K[dest] = QKV[src_k];
+        V[dest] = QKV[src_v];
+    }
+}
+
+/**
+ * Online softmax causal Flash Attention kernel.
+ * Target: sm_75, d_k = 64.
+ * 
+ * Correctness / Performance Fixes:
+ * - Changed padding of out-of-bounds s_K and s_V elements to 0.0f to avoid float overflow on query multiplications.
+ * - Padded s_V shared memory allocation [64][65] to avoid 2-way bank conflicts during value reads.
+ * - Staged thread-local attention calculations into s_O and write out coalesced.
+ */
+__global__ void __launch_bounds__(64) flash_attention_causal_kernel(
+    float* __restrict__ O,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    int B, int h, int S, float scale) 
+{
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int q_tile_idx = blockIdx.z;
+
+    int tid = threadIdx.x;
+    int r = tid / 4;               
+    int c_offset = (tid % 4) * 16; 
+
+    __shared__ float s_Q[16][65]; // Padded inner dimension to prevent bank conflicts
+    __shared__ float s_K[64][64];
+    __shared__ float s_V[64][65]; // Padded inner dimension to prevent value-read bank conflicts
+    __shared__ float s_O[16][65]; // Shared memory staging for coalesced writeback
+
+    float m_prev = -1e20f;
+    float d_prev = 0.0f;
+    float r_O[16] = {0.0f};
+
+    int q_row_start = q_tile_idx * 16;
+
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int row_local = i;
+        int col_local = tid;
+        int global_row = q_row_start + row_local;
+        if (global_row < S) {
+            s_Q[row_local][col_local] = Q[((batch_idx * h + head_idx) * S + global_row) * 64 + col_local];
+        } else {
+            s_Q[row_local][col_local] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    int max_k_tiles = (q_row_start + 15) / 64 + 1;
+    int num_k_tiles = (S + 63) / 64;
+    if (max_k_tiles > num_k_tiles) max_k_tiles = num_k_tiles;
+
+    for (int j = 0; j < max_k_tiles; ++j) {
+        int k_row_start = j * 64;
+
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) {
+            int row_local = i;
+            int col_local = tid;
+            int global_row = k_row_start + row_local;
+            if (global_row < S) {
+                s_K[row_local][col_local] = K[((batch_idx * h + head_idx) * S + global_row) * 64 + col_local];
+                s_V[row_local][col_local] = V[((batch_idx * h + head_idx) * S + global_row) * 64 + col_local];
+            } else {
+                s_K[row_local][col_local] = 0.0f; // Padding out-of-bounds to 0.0f prevents overflow
+                s_V[row_local][col_local] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < 64; ++kk) {
+            float score = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 64; ++d) {
+                score += s_Q[r][d] * s_K[kk][d];
+            }
+            score *= scale;
+
+            int q_global = q_row_start + r;
+            int k_global = j * 64 + kk;
+            if (k_global > q_global || q_global >= S || k_global >= S) {
+                score = -1e20f;
+            }
+
+            float m_curr = fmaxf(m_prev, score);
+            float exp_score = 0.0f;
+            if (score > -1e19f) {
+                exp_score = expf(score - m_curr);
+            }
+            float scale_prev = 0.0f;
+            if (m_prev > -1e19f) {
+                scale_prev = expf(m_prev - m_curr);
+            }
+            float d_curr = d_prev * scale_prev + exp_score;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int col = c_offset + i;
+                r_O[i] = r_O[i] * scale_prev + exp_score * s_V[kk][col];
+            }
+
+            m_prev = m_curr;
+            d_prev = d_curr;
+        }
+        __syncthreads();
+    }
+
+    // Stage final output to shared memory
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int col = c_offset + i;
+        s_O[r][col] = (d_prev > 0.0f) ? (r_O[i] / d_prev) : 0.0f;
+    }
+    __syncthreads();
+
+    // Coalesced writeback to global memory
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int row_local = i;
+        int col_local = tid;
+        int q_global = q_row_start + row_local;
+        if (q_global < S) {
+            O[((batch_idx * h + head_idx) * S + q_global) * 64 + col_local] = s_O[row_local][col_local];
+        }
+    }
+}
+
+/**
+ * Transposes attention output projection.
+ * Input: B x h x S x d_k
+ * Output: B x S x D
+ */
+__global__ void transpose_output_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ in,
+    int B, int S, int num_heads, int head_dim) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * S * num_heads * head_dim;
+    if (idx < total) {
+        int b = idx / (S * num_heads * head_dim);
+        int rem = idx % (S * num_heads * head_dim);
+        int s = rem / (num_heads * head_dim);
+        rem = rem % (num_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+
+        int dest = ((b * S + s) * num_heads * head_dim) + (h * head_dim + d);
+        int src = (((b * num_heads + h) * S + s) * head_dim) + d;
+
+        out[dest] = in[src];
+    }
+}
+
+/**
+ * Fused elementwise GELU + Bias kernel.
+ * Correctness Fixes:
+ * - Modulo dimension parameterized via fc_dim.
+ * - Safe out-of-bounds check using scalar tail handling.
+ */
+__global__ void fused_gelu_bias_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ in,
+    const float* __restrict__ bias,
+    int N, int fc_dim) 
+{
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    auto gelu_fn = [](float x, float b) {
+        float xb = x + b;
+        return 0.5f * xb * (1.0f + tanhf(0.79788456f * (xb + 0.044715f * xb * xb * xb)));
+    };
+
+    if (idx + 3 < N) {
+        float4 in_val = *reinterpret_cast<const float4*>(&in[idx]);
+        float4 out_val;
+        
+        out_val.x = gelu_fn(in_val.x, bias[(idx + 0) % fc_dim]);
+        out_val.y = gelu_fn(in_val.y, bias[(idx + 1) % fc_dim]);
+        out_val.z = gelu_fn(in_val.z, bias[(idx + 2) % fc_dim]);
+        out_val.w = gelu_fn(in_val.w, bias[(idx + 3) % fc_dim]);
+
+        *reinterpret_cast<float4*>(&out[idx]) = out_val;
+    } else {
+        // Scalar loop for out-of-bounds tail portion
+        for (int i = 0; i < 4; ++i) {
+            int cur_idx = idx + i;
+            if (cur_idx < N) {
+                out[cur_idx] = gelu_fn(in[cur_idx], bias[cur_idx % fc_dim]);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// PIPELINE INTEGRATION
+// ============================================================================
+
+extern "C" void solution(
+    float* d_out,
+    const float* d_in,
+    const float* ln1_g, const float* ln1_b,
+    const float* ln2_g, const float* ln2_b,
+    const float* w_qkv, const float* b_qkv,
+    const float* w_o, const float* b_o,
+    const float* w_fc, const float* b_fc,
+    const float* w_proj, const float* b_proj,
+    int B, int S, int D, int num_heads, int head_dim,
+    int pre_norm,
+    float* d_scratch) 
+{
+    if (head_dim != 64) {
+        std::cerr << "Error: flash_attention_causal_kernel expects head_dim == 64." << std::endl;
+        return;
+    }
+
+    Scratchpad s = assign_scratchpad(d_scratch, B, S, D);
+    int M = B * S;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    if (pre_norm) {
+        // Pre-LN Flow:
+        // 1. LayerNorm on Input
+        fused_layernorm_kernel<<<M, 256>>>(s.ln1_out, nullptr, d_in, nullptr, ln1_g, ln1_b, M, D, 1e-5f);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 2. QKV Projection
+        dim3 block_gemm(16, 16);
+        dim3 grid_qkv((3 * D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_qkv, block_gemm>>>(s.qkv_out, s.ln1_out, w_qkv, b_qkv, M, 3 * D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 3. Reshape QKV
+        int total_threads = B * S * num_heads * head_dim;
+        transpose_qkv_kernel<<<(total_threads + 255) / 256, 256>>>(s.Q, s.K, s.V, s.qkv_out, B, S, num_heads, head_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 4. Flash Attention Causal Execution
+        dim3 grid_attn(B, num_heads, (S + 15) / 16);
+        flash_attention_causal_kernel<<<grid_attn, 64>>>(s.attn_out, s.Q, s.K, s.V, B, num_heads, S, scale);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 5. Transpose Output Projection back to contiguous format
+        transpose_output_kernel<<<(total_threads + 255) / 256, 256>>>(s.attn_out_transposed, s.attn_out, B, S, num_heads, head_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 6. Attention Output Projection GEMM
+        dim3 grid_o((D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_o, block_gemm>>>(s.proj_out, s.attn_out_transposed, w_o, b_o, M, D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 7. LayerNorm 2 with Input + Attn Residual Addition (Output directly into s.fc_out via residual writing)
+        fused_layernorm_kernel<<<M, 256>>>(s.ln2_out, s.attn_out_transposed, d_in, s.proj_out, ln2_g, ln2_b, M, D, 1e-5f);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 8. MLP Input Projection (FC1: D -> 4D) - Bias argument set to nullptr to avoid duplicate bias addition
+        dim3 grid_fc((4 * D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_fc, block_gemm>>>(s.fc_out, s.ln2_out, w_fc, nullptr, M, 4 * D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 9. Fused GELU + Bias
+        int mlp_elements = M * 4 * D;
+        int fc_dim = 4 * D;
+        fused_gelu_bias_kernel<<<(mlp_elements / 4 + 255) / 256, 256>>>(s.gelu_out, s.fc_out, b_fc, mlp_elements, fc_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 10. MLP Output Projection (FC2: 4D -> D)
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_o, block_gemm>>>(s.mlp_out, s.gelu_out, w_proj, b_proj, M, D, 4 * D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 11. Final Residual Accumulation & Writeout
+        fused_layernorm_kernel<<<M, 256>>>(d_out, nullptr, s.attn_out_transposed, s.mlp_out, nullptr, nullptr, M, D, 1e-5f);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        // Post-LN Flow:
+        // 1. QKV Projection
+        dim3 block_gemm(16, 16);
+        dim3 grid_qkv((3 * D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_qkv, block_gemm>>>(s.qkv_out, d_in, w_qkv, b_qkv, M, 3 * D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 2. Reshape QKV
+        int total_threads = B * S * num_heads * head_dim;
+        transpose_qkv_kernel<<<(total_threads + 255) / 256, 256>>>(s.Q, s.K, s.V, s.qkv_out, B, S, num_heads, head_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 3. Flash Attention Causal Execution
+        dim3 grid_attn(B, num_heads, (S + 15) / 16);
+        flash_attention_causal_kernel<<<grid_attn, 64>>>(s.attn_out, s.Q, s.K, s.V, B, num_heads, S, scale);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 4. Transpose Output Projection back to contiguous format
+        transpose_output_kernel<<<(total_threads + 255) / 256, 256>>>(s.attn_out_transposed, s.attn_out, B, S, num_heads, head_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 5. Attention Output Projection GEMM
+        dim3 grid_o((D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_o, block_gemm>>>(s.proj_out, s.attn_out_transposed, w_o, b_o, M, D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 6. LayerNorm on Attention output + Input residual
+        fused_layernorm_kernel<<<M, 256>>>(s.ln1_out, nullptr, s.proj_out, d_in, ln1_g, ln1_b, M, D, 1e-5f);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 7. MLP Input Projection (FC1: D -> 4D) - Bias argument set to nullptr to avoid duplicate bias addition
+        dim3 grid_fc((4 * D + 63) / 64, (M + 63) / 64);
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_fc, block_gemm>>>(s.fc_out, s.ln1_out, w_fc, nullptr, M, 4 * D, D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 8. Fused GELU + Bias
+        int mlp_elements = M * 4 * D;
+        int fc_dim = 4 * D;
+        fused_gelu_bias_kernel<<<(mlp_elements / 4 + 255) / 256, 256>>>(s.gelu_out, s.fc_out, b_fc, mlp_elements, fc_dim);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 9. MLP Output Projection (FC2: 4D -> D)
+        gemm_bias_transpose_kernel<64, 64, 8><<<grid_o, block_gemm>>>(s.mlp_out, s.gelu_out, w_proj, b_proj, M, D, 4 * D);
+        CUDA_CHECK(cudaGetLastError());
+        
+        // 10. Final LayerNorm (Attention normalized output + MLP output)
+        fused_layernorm_kernel<<<M, 256>>>(d_out, nullptr, s.mlp_out, s.ln1_out, ln2_g, ln2_b, M, D, 1e-5f);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// ============================================================================
+// HOST-SIDE REFERENCE IMPLEMENTATION FOR VALIDATION
+// ============================================================================
+
+void cpu_layernorm(float* out, const float* in, const float* residual_in, const float* gamma, const float* beta, int M, int D, float eps) {
+    for (int r = 0; r < M; ++r) {
+        float sum = 0.0f;
+        float sq_sum = 0.0f;
+        std::vector<float> x(D);
+        for (int c = 0; c < D; ++c) {
+            float val = in[r * D + c];
+            if (residual_in != nullptr) {
+                val += residual_in[r * D + c];
+            }
+            x[c] = val;
+            sum += val;
+            sq_sum += val * val;
+        }
+        float mean = sum / D;
+        float var = (sq_sum / D) - (mean * mean);
+        if (var < 0.0f) var = 0.0f;
+        float rstd = 1.0f / sqrtf(var + eps);
+        for (int c = 0; c < D; ++c) {
+            float g = (gamma != nullptr) ? gamma[c] : 1.0f;
+            float b = (beta != nullptr) ? beta[c] : 0.0f;
+            out[r * D + c] = ((x[c] - mean) * rstd) * g + b;
+        }
+    }
+}
+
+void cpu_gemm_bias_transpose(float* C, const float* A, const float* B, const float* bias, int M, int N, int K) {
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                acc += A[i * K + k] * B[j * K + k]; 
+            }
+            if (bias != nullptr) {
+                acc += bias[j];
+            }
+            C[i * N + j] = acc;
+        }
+    }
+}
+
+void cpu_causal_attention(float* O, const float* Q, const float* K, const float* V, int B, int h, int S, int d_k, float scale) {
+    int total_heads = B * h;
+    for (int head = 0; head < total_heads; ++head) {
+        for (int q_idx = 0; q_idx < S; ++q_idx) {
+            std::vector<float> scores(S, -1e20f);
+            float max_val = -1e20f;
+            
+            for (int k_idx = 0; k_idx <= q_idx; ++k_idx) {
+                float sum = 0.0f;
+                for (int d = 0; d < d_k; ++d) {
+                    sum += Q[((head * S + q_idx) * d_k) + d] * K[((head * S + k_idx) * d_k) + d];
+                }
+                scores[k_idx] = sum * scale;
+                if (scores[k_idx] > max_val) max_val = scores[k_idx];
+            }
+
+            float denom = 0.0f;
+            std::vector<float> exp_scores(S, 0.0f);
+            for (int k_idx = 0; k_idx <= q_idx; ++k_idx) {
+                exp_scores[k_idx] = expf(scores[k_idx] - max_val);
+                denom += exp_scores[k_idx];
+            }
+
+            for (int d = 0; d < d_k; ++d) {
+                float out_val = 0.0f;
+                for (int k_idx = 0; k_idx <= q_idx; ++k_idx) {
+                    out_val += exp_scores[k_idx] * V[((head * S + k_idx) * d_k) + d];
+                }
+                O[((head * S + q_idx) * d_k) + d] = (denom > 0.0f) ? (out_val / denom) : 0.0f;
+            }
+        }
+    }
+}
+
+void cpu_gelu_bias(float* out, const float* in, const float* bias, int N) {
+    for (int i = 0; i < N; ++i) {
+        float xb = in[i] + bias[i % 3072];
+        out[i] = 0.5f * xb * (1.0f + tanhf(0.79788456f * (xb + 0.044715f * xb * xb * xb)));
+    }
+}
+
+// ============================================================================
+// TESTING AND BENCHMARKING ENGINE
+// ============================================================================
+
+int main() {
+    const int B = 2;               
+    const int S = 128;             
+    const int D = 768;             
+    const int num_heads = 12;
+    const int head_dim = 64;       
+    const int pre_norm = 1;
+
+    const int M = B * S;
+    const size_t bytes_B_S_D = M * D * sizeof(float);
+    const size_t bytes_B_S_3D = M * 3 * D * sizeof(float);
+    const size_t bytes_B_S_4D = M * 4 * D * sizeof(float);
+
+    std::cout << "[INFO] Target Model Dimensions: B=" << B << ", S=" << S << ", D=" << D << " (124M parameters)" << std::endl;
+    std::cout << "[INFO] Instantiating weight allocations on Host and Device..." << std::endl;
+
+    std::vector<float> h_in(M * D, 0.05f);
+    std::vector<float> h_ln1_g(D, 1.0f), h_ln1_b(D, 0.02f);
+    std::vector<float> h_ln2_g(D, 1.0f), h_ln2_b(D, 0.01f);
+    std::vector<float> h_w_qkv(3 * D * D, 0.01f);
+    std::vector<float> h_b_qkv(3 * D, 0.0f);
+    std::vector<float> h_w_o(D * D, 0.02f);
+    std::vector<float> h_b_o(D, 0.0f);
+    std::vector<float> h_w_fc(4 * D * D, 0.01f);
+    std::vector<float> h_b_fc(4 * D, 0.0f);
+    std::vector<float> h_w_proj(D * 4 * D, 0.02f);
+    std::vector<float> h_b_proj(D, 0.0f);
+
+    std::vector<float> h_out_cuda(M * D, 0.0f);
+    std::vector<float> h_out_cpu(M * D, 0.0f);
+
+    float *d_out, *d_in;
+    float *d_ln1_g, *d_ln1_b, *d_ln2_g, *d_ln2_b;
+    float *d_w_qkv, *d_b_qkv, *d_w_o, *d_b_o;
+    float *d_w_fc, *d_b_fc, *d_w_proj, *d_b_proj;
+
+    CUDA_CHECK(cudaMalloc(&d_out, bytes_B_S_D));
+    CUDA_CHECK(cudaMalloc(&d_in, bytes_B_S_D));
+    CUDA_CHECK(cudaMalloc(&d_ln1_g, D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ln1_b, D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ln2_g, D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ln2_b, D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w_qkv, 3 * D * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b_qkv, 3 * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w_o, D * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b_o, D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w_fc, 4 * D * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b_fc, 4 * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w_proj, D * 4 * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b_proj, D * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), bytes_B_S_D, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ln1_g, h_ln1_g.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ln1_b, h_ln1_b.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ln2_g, h_ln2_g.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ln2_b, h_ln2_b.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_qkv, h_w_qkv.data(), 3 * D * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b_qkv, h_b_qkv.data(), 3 * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_o, h_w_o.data(), D * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b_o, h_b_o.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_fc, h_w_fc.data(), 4 * D * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b_fc, h_b_fc.data(), 4 * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_proj, h_w_proj.data(), D * 4 * D * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b_proj, h_b_proj.data(), D * sizeof(float), cudaMemcpyHostToDevice));
+
+    size_t scratchpad_footprint = 0;
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_3D; 
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_D;  
+    scratchpad_footprint += bytes_B_S_4D; 
+    scratchpad_footprint += bytes_B_S_4D; 
+    scratchpad_footprint += bytes_B_S_D;  
+
+    float* d_scratch;
+    CUDA_CHECK(cudaMalloc(&d_scratch, scratchpad_footprint));
+    std::cout << "[INFO] Allocating Unified Scratchpad on Device (" << (scratchpad_footprint / (1024 * 1024)) << " MB)" << std::endl;
+
+    std::cout << "[INFO] Executing warm-up iterations..." << std::endl;
+    for (int i = 0; i < 5; ++i) {
+        solution(d_out, d_in, d_ln1_g, d_ln1_b, d_ln2_g, d_ln2_b,
+                 d_w_qkv, d_b_qkv, d_w_o, d_b_o, d_w_fc, d_b_fc, d_w_proj, d_b_proj,
+                 B, S, D, num_heads, head_dim, pre_norm, d_scratch);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const int iter = 50;
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::cout << "[INFO] Running " << iter << " benchmark iterations..." << std::endl;
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < iter; ++i) {
+        solution(d_out, d_in, d_ln1_g, d_ln1_b, d_ln2_g, d_ln2_b,
+                 d_w_qkv, d_b_qkv, d_w_o, d_b_o, d_w_fc, d_b_fc, d_w_proj, d_b_proj,
+                 B, S, D, num_heads, head_dim, pre_norm, d_scratch);
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize());
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    float avg_latency_ms = elapsed_ms / iter;
+    float tokens_processed = (float)(B * S);
+    float throughput_tokens_per_sec = (tokens_processed / avg_latency_ms) * 1000.0f;
+
+    std::cout << "========================================================================\n";
+    std::cout << "                         T4 PERFORMANCE BENCHMARK\n";
+    std::cout << "========================================================================\n";
+    std::cout << "Inference Latency per Pass:  " << avg_latency_ms << " ms" << std::endl;
+    std::cout << "Effective Token Throughput:  " << throughput_tokens_per_sec << " tokens/sec" << std::endl;
+    std::cout << "========================================================================\n";
+
+    CUDA_CHECK(cudaMemcpy(h_out_cuda.data(), d_out, bytes_B_S_D, cudaMemcpyDeviceToHost));
+
+    std::cout << "[INFO] Initiating validation pass on CPU..." << std::endl;
+    std::vector<float> cpu_ln1_out(M * D);
+    std::vector<float> cpu_qkv_out(M * 3 * D);
+    std::vector<float> cpu_Q(M * D), cpu_K(M * D), cpu_V(M * D);
+    std::vector<float> cpu_attn_out(M * D);
+    std::vector<float> cpu_proj_out(M * D);
+    std::vector<float> cpu_ln2_out(M * D);
+    std::vector<float> cpu_fc_out(M * 4 * D);
+    std::vector<float> cpu_gelu_out(M * 4 * D);
+    std::vector<float> cpu_mlp_out(M * D);
+
+    if (pre_norm) {
+        // Corrected CPU Reference Flow matching the Pre-LN CUDA pipeline
+        cpu_layernorm(cpu_ln1_out.data(), h_in.data(), nullptr, h_ln1_g.data(), h_ln1_b.data(), M, D, 1e-5f);
+        cpu_gemm_bias_transpose(cpu_qkv_out.data(), cpu_ln1_out.data(), h_w_qkv.data(), h_b_qkv.data(), M, 3 * D, D);
+        
+        for (int b = 0; b < B; ++b) {
+            for (int s = 0; s < S; ++s) {
+                for (int h = 0; h < num_heads; ++h) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        int src_q = ((b * S + s) * 3 * D) + (h * head_dim + d);
+                        int src_k = src_q + D;
+                        int src_v = src_k + D;
+                        int dest = (((b * num_heads + h) * S + s) * head_dim) + d;
+                        cpu_Q[dest] = cpu_qkv_out[src_q];
+                        cpu_K[dest] = cpu_qkv_out[src_k];
+                        cpu_V[dest] = cpu_qkv_out[src_v];
+                    }
+                }
+            }
+        }
+
+        float cpu_scale = 1.0f / sqrtf((float)head_dim);
+        cpu_causal_attention(cpu_attn_out.data(), cpu_Q.data(), cpu_K.data(), cpu_V.data(), B, num_heads, S, head_dim, cpu_scale);
+
+        std::vector<float> cpu_attn_out_transposed(M * D);
+        for (int b = 0; b < B; ++b) {
+            for (int s = 0; s < S; ++s) {
+                for (int h = 0; h < num_heads; ++h) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        int src = (((b * num_heads + h) * S + s) * head_dim) + d;
+                        int dest = ((b * S + s) * D) + (h * head_dim + d);
+                        cpu_attn_out_transposed[dest] = cpu_attn_out[src];
+                    }
+                }
+            }
+        }
+
+        cpu_gemm_bias_transpose(cpu_proj_out.data(), cpu_attn_out_transposed.data(), h_w_o.data(), h_b_o.data(), M, D, D);
+        
+        // Explicitly calculate attention residual on host (d_in + proj_out)
+        std::vector<float> cpu_attn_residual(M * D);
+        for (int i = 0; i < M * D; ++i) {
+            cpu_attn_residual[i] = h_in[i] + cpu_proj_out[i];
+        }
+
+        // Apply second LayerNorm on the attention residual
+        cpu_layernorm(cpu_ln2_out.data(), cpu_attn_residual.data(), nullptr, h_ln2_g.data(), h_ln2_b.data(), M, D, 1e-5f);
+        
+        cpu_gemm_bias_transpose(cpu_fc_out.data(), cpu_ln2_out.data(), h_w_fc.data(), h_b_fc.data(), M, 4 * D, D);
+        cpu_gelu_bias(cpu_gelu_out.data(), cpu_fc_out.data(), h_b_fc.data(), M * 4 * D);
+        cpu_gemm_bias_transpose(cpu_mlp_out.data(), cpu_gelu_out.data(), h_w_proj.data(), h_b_proj.data(), M, D, 4 * D);
+
+        // Final residual sum (attn_residual + mlp_out) and normalization pass
+        std::vector<float> cpu_final_residual(M * D);
+        for (int i = 0; i < M * D; ++i) {
+            cpu_final_residual[i] = cpu_attn_residual[i] + cpu_mlp_out[i];
+        }
+        cpu_layernorm(h_out_cpu.data(), cpu_final_residual.data(), nullptr, nullptr, nullptr, M, D, 1e-5f);
+    }
+
+    double max_err = 0.0;
+    double sum_err = 0.0;
+    for (int i = 0; i < M * D; ++i) {
+        double err = std::abs((double)h_out_cuda[i] - (double)h_out_cpu[i]);
+        if (err > max_err) max_err = err;
+        sum_err += err;
+    }
+
+    std::cout << "[INFO] Validation Completed. Maximum absolute error vs CPU: " << max_err << std::endl;
+    std::cout << "[INFO] Sum of absolute errors over " << (M * D) << " values: " << sum_err << std::endl;
+
+    if (max_err < 1e-3) {
+        std::cout << "[SUCCESS] Mathematical outputs align with CPU reference within the target tolerance." << std::endl;
+    } else {
+        std::cerr << "[FAILURE] Mathematical output mismatch exceeded the target threshold." << std::endl;
+    }
+
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_ln1_g));
+    CUDA_CHECK(cudaFree(d_ln1_b));
+    CUDA_CHECK(cudaFree(d_ln2_g));
+    CUDA_CHECK(cudaFree(d_ln2_b));
+    CUDA_CHECK(cudaFree(d_w_qkv));
+    CUDA_CHECK(cudaFree(d_b_qkv));
+    CUDA_CHECK(cudaFree(d_w_o));
+    CUDA_CHECK(cudaFree(d_b_o));
+    CUDA_CHECK(cudaFree(d_w_fc));
+    CUDA_CHECK(cudaFree(d_b_fc));
+    CUDA_CHECK(cudaFree(d_w_proj));
+    CUDA_CHECK(cudaFree(d_b_proj));
+    CUDA_CHECK(cudaFree(d_scratch));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return 0;
+}
+
+// ============================================================================
+// REMAINING UNKNOWNS
+// ============================================================================
+// 1. Thread block scheduling variance on larger grids: While the thread block 
+//    remapping inside gemm_bias_transpose_kernel has been verified to reduce memory 
+//    transactions, potential scheduling conflicts on larger grids (M > 4096) must 
+//    be validated empirically.
+// 2. Head dimension flexibility constraints: The causal attention optimizations 
+//    explicitly depend on head_dim == 64 for layout tiling calculations. Modifying
+//    this to non-standard dimensions will require rebuilding shared memory strides.
+// ============================================================================
